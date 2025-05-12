@@ -306,3 +306,243 @@
         (ok true)
     )
 )
+
+(define-public (withdraw-staking-rewards)
+    (let
+        (
+            (staker (unwrap! (map-get? stakers tx-sender) ERR_NOT_AUTHORIZED))
+            (rewards (get rewards staker))
+        )
+        (asserts! (> rewards u0) ERR_NOT_AUTHORIZED)
+        (try! (as-contract (stx-transfer? rewards tx-sender (as-contract tx-sender))))
+        (map-set stakers tx-sender
+            (merge staker
+                {
+                    rewards: u0
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+
+;; Add new map for tier definitions
+(define-map coverage-tiers
+    uint ;; tier ID
+    {
+        min-amount: uint,
+        max-amount: uint,
+        premium-rate: uint
+    }
+)
+
+;; Initialize with default tiers
+(define-data-var next-tier-id uint u1)
+
+;; Function to add a new coverage tier
+(define-public (add-coverage-tier (min-amount uint) (max-amount uint) (premium-ratee uint))
+    (begin
+        (asserts! (not (var-get contract-paused)) (err u104))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (< min-amount max-amount) (err u105))
+        
+        (let ((tier-id (var-get next-tier-id)))
+            (map-set coverage-tiers tier-id
+                {
+                    min-amount: min-amount,
+                    max-amount: max-amount,
+                    premium-rate: premium-ratee
+                }
+            )
+            (var-set next-tier-id (+ tier-id u1))
+            (ok tier-id)
+        )
+    )
+)
+
+;; Function to remove a coverage tier
+(define-public (remove-coverage-tier (tier-id uint))
+    (begin
+        (asserts! (not (var-get contract-paused)) (err u104))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (map-delete coverage-tiers tier-id) (err u106))
+        (ok true)
+    )
+)
+
+;; Updated premium calculation function that uses tiers
+(define-read-only (calculate-premium-tiered (coverage-amount uint))
+    (let ((tier-rate (find-applicable-tier-rate coverage-amount)))
+        (/ (* coverage-amount tier-rate) u1000)
+    )
+)
+
+;; Helper function to find the applicable tier rate
+(define-read-only (find-applicable-tier-rate (coverage-amount uint))
+    (let 
+        (
+            (default-rate (var-get premium-rate))
+            (tier-1 (unwrap-panic (map-get? coverage-tiers u1)))
+        )
+        (if (and 
+                (>= coverage-amount (get min-amount tier-1))
+                (<= coverage-amount (get max-amount tier-1))
+            )
+            (get premium-rate tier-1)
+            default-rate
+        )
+    )
+)
+
+;; Helper function to check tier applicability
+(define-private (check-tier-amount
+    (tier {min-amount: uint, max-amount: uint, premium-rate: uint})
+    (amount uint))
+    
+    (if (and 
+            (>= amount (get min-amount tier))
+            (<= amount (get max-amount tier))
+        )
+        (some (get premium-rate tier))
+        none
+    )
+)
+
+;; Updated purchase-coverage function to use tiered pricing
+(define-public (purchase-coverage-tiered (coverage-amount uint) (duration uint))
+    (let
+        (
+            (premium-to-pay (calculate-premium-tiered coverage-amount))
+            (expiry-blocks (* duration BLOCKS_PER_MONTH))
+        )
+        (asserts! (not (var-get contract-paused)) (err u104))
+        (asserts! (>= coverage-amount (var-get min-coverage-amount)) ERR_INVALID_COVERAGE)
+        (try! (stx-transfer? premium-to-pay tx-sender (as-contract tx-sender)))
+        
+        (map-set insurance-policies tx-sender
+            {
+                coverage-amount: coverage-amount,
+                premium-paid: premium-to-pay,
+                active: true,
+                start-height: stacks-block-height,
+                expiry-height: (+ stacks-block-height expiry-blocks)
+            }
+        )
+        (var-set total-policies-issued (+ (var-get total-policies-issued) u1))
+        (var-set total-premiums-collected (+ (var-get total-premiums-collected) premium-to-pay))
+        (ok true)
+    )
+)
+
+;; ;; Function to get all tiers
+;; (define-read-only (get-all-tiers)
+;;     (map-to-list coverage-tiers)
+;; )
+
+;; Function to get a specific tier
+(define-read-only (get-tier (tier-id uint))
+    (map-get? coverage-tiers tier-id)
+)
+
+
+;; Add new data var for renewal discount
+(define-data-var renewal-discount-rate uint u10) ;; 1% discount represented as 10/1000
+
+;; Add renewal count to policy data
+(define-map insurance-policiess
+    principal
+    {
+        coverage-amount: uint,
+        premium-paid: uint,
+        active: bool,
+        start-height: uint,
+        expiry-height: uint,
+        renewal-count: uint
+    }
+)
+
+;; Function to set renewal discount rate
+(define-public (set-renewal-discount-rate (rate uint))
+    (begin
+        (asserts! (not (var-get contract-paused)) (err u104))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (var-set renewal-discount-rate rate)
+        (ok true)
+    )
+)
+
+;; Function to calculate renewal premium with discount
+(define-read-only (calculate-renewal-premium (coverage-amount uint) (renewal-count uint))
+    (let 
+        (
+            (base-premium (calculate-premium coverage-amount))
+            (capped-renewals (if (>= renewal-count u5) u5 renewal-count))
+            (discount-multiplier (- u1000 (* (var-get renewal-discount-rate) capped-renewals)))
+        )
+        (/ (* base-premium discount-multiplier) u1000)
+    )
+)
+
+;; Function to renew an existing policy
+(define-public (renew-policy (duration uint))
+    (let
+        (
+            (policy (unwrap! (map-get? insurance-policiess tx-sender) ERR_NOT_AUTHORIZED))
+            (coverage-amount (get coverage-amount policy))
+            (renewal-count (get renewal-count policy))
+            (premium-to-pay (calculate-renewal-premium coverage-amount renewal-count))
+            (expiry-blocks (* duration BLOCKS_PER_MONTH))
+        )
+        (asserts! (not (var-get contract-paused)) (err u104))
+        
+        ;; Check if policy is active or recently expired (within 30 days)
+        (asserts! (or 
+            (get active policy)
+            (< (- stacks-block-height (get expiry-height policy)) BLOCKS_PER_MONTH)
+        ) (err u107))
+        
+        (try! (stx-transfer? premium-to-pay tx-sender (as-contract tx-sender)))
+        
+        (map-set insurance-policiess tx-sender
+            {
+                coverage-amount: coverage-amount,
+                premium-paid: premium-to-pay,
+                active: true,
+                start-height: stacks-block-height,
+                expiry-height: (+ stacks-block-height expiry-blocks),
+                renewal-count: (+ renewal-count u1)
+            }
+        )
+        (var-set total-premiums-collected (+ (var-get total-premiums-collected) premium-to-pay))
+        (ok true)
+    )
+)
+
+;; Function to get renewal discount for a user
+;; (define-read-only (get-renewal-discount (user principal))
+;;     (let
+;;         (
+;;             (policy (unwrap! (map-get? insurance-policiess user) (err u108)))
+;;             (renewal-count (get renewal-count policy))
+;;             (capped-renewals (if (>= renewal-count u5) u5 renewal-count))
+;;         )
+;;         (* (var-get renewal-discount-rate) capped-renewals)
+;;     )
+;; )
+
+;; Function to check if a policy is renewable
+(define-read-only (is-policy-renewable (user principal))
+    (let
+        (
+            (policy (unwrap! (map-get? insurance-policies user) false))
+        )
+        (and 
+            ;; (is-some policy)
+            (or 
+                (get active policy)
+                (< (- stacks-block-height (get expiry-height policy)) BLOCKS_PER_MONTH)
+            )
+        )
+    )
+)
