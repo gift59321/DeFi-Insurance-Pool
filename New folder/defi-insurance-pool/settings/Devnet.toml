@@ -1,0 +1,18 @@
+Sure, here's the contents for the file: /defi-insurance-pool/defi-insurance-pool/settings/Devnet.toml
+
+# Devnet Configuration for DeFi Insurance Pool
+
+[network]
+name = "devnet"
+url = "http://localhost:20443"
+
+[contracts]
+insurance_pool = { address = "SP1234567890abcdef1234567890abcdef12345678" }
+coverage_tiers = { address = "SPabcdef1234567890abcdef1234567890abcdef12" }
+claims = { address = "SPabcdefabcdef1234567890abcdef1234567890ab" }
+risk_assessment = { address = "SPabcdefabcdefabcdef1234567890abcdef123456" }
+
+[settings]
+gas_limit = 1000000
+max_fee = 1000
+confirmations = 1
