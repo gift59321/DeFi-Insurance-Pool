@@ -24,6 +24,11 @@ epoch = 3.1
 path = 'contracts/coverage-tiers.clar'
 clarity_version = 3
 epoch = 3.1
+
+[contracts.Parametric-Triggers]
+path = 'contracts/Parametric-Triggers.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
