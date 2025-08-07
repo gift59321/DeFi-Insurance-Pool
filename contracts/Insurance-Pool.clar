@@ -10,6 +10,37 @@
 (define-data-var min-coverage-amount uint u1000000) ;; in micro STX
 (define-data-var premium-rate uint u5) ;; 0.5% represented as 5/1000
 
+
+(define-constant ERR_NOT_APPROVER (err u200))
+(define-constant ERR_ALREADY_VOTED (err u201))
+(define-constant ERR_CLAIM_NOT_FOUND (err u202))
+(define-constant ERR_INSUFFICIENT_VOTES (err u203))
+(define-constant ERR_CLAIM_ALREADY_PROCESSED (err u204))
+
+(define-data-var required-approvals uint u3)
+(define-data-var total-approvers uint u0)
+
+(define-map approvers
+    principal
+    bool
+)
+
+(define-map claim-votes
+    principal
+    {
+        approve-votes: uint,
+        reject-votes: uint,
+        voted-approvers: (list 10 principal),
+        status: (string-ascii 20),
+        processed: bool
+    }
+)
+
+(define-map approver-votes
+    {claim-user: principal, approver: principal}
+    (string-ascii 10)
+)
+
 ;; Data maps
 (define-map insurance-policies
     principal
@@ -519,18 +550,6 @@
     )
 )
 
-;; Function to get renewal discount for a user
-;; (define-read-only (get-renewal-discount (user principal))
-;;     (let
-;;         (
-;;             (policy (unwrap! (map-get? insurance-policiess user) (err u108)))
-;;             (renewal-count (get renewal-count policy))
-;;             (capped-renewals (if (>= renewal-count u5) u5 renewal-count))
-;;         )
-;;         (* (var-get renewal-discount-rate) capped-renewals)
-;;     )
-;; )
-
 ;; Function to check if a policy is renewable
 (define-read-only (is-policy-renewable (user principal))
     (let
@@ -543,6 +562,156 @@
                 (get active policy)
                 (< (- stacks-block-height (get expiry-height policy)) BLOCKS_PER_MONTH)
             )
+        )
+    )
+)
+
+
+(define-public (add-approver (new-approver principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (not (default-to false (map-get? approvers new-approver))) ERR_NOT_AUTHORIZED)
+        (map-set approvers new-approver true)
+        (var-set total-approvers (+ (var-get total-approvers) u1))
+        (ok true)
+    )
+)
+
+(define-public (remove-approver (approver principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (default-to false (map-get? approvers approver)) ERR_NOT_APPROVER)
+        (map-delete approvers approver)
+        (var-set total-approvers (- (var-get total-approvers) u1))
+        (ok true)
+    )
+)
+
+(define-public (set-required-approvals (count uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (> count u0) ERR_NOT_AUTHORIZED)
+        (asserts! (<= count (var-get total-approvers)) ERR_NOT_AUTHORIZED)
+        (var-set required-approvals count)
+        (ok true)
+    )
+)
+
+(define-public (vote-on-claim (claim-user principal) (vote-type (string-ascii 10)))
+    (let
+        (
+            (current-votes (default-to 
+                {approve-votes: u0, reject-votes: u0, voted-approvers: (list), status: "PENDING", processed: false}
+                (map-get? claim-votes claim-user)
+            ))
+            (vote-key {claim-user: claim-user, approver: tx-sender})
+        )
+        (asserts! (default-to false (map-get? approvers tx-sender)) ERR_NOT_APPROVER)
+        (asserts! (is-none (map-get? approver-votes vote-key)) ERR_ALREADY_VOTED)
+        (asserts! (not (get processed current-votes)) ERR_CLAIM_ALREADY_PROCESSED)
+        (asserts! (is-some (map-get? claims claim-user)) ERR_CLAIM_NOT_FOUND)
+        
+        (map-set approver-votes vote-key vote-type)
+        
+        (if (is-eq vote-type "APPROVE")
+            (map-set claim-votes claim-user
+                (merge current-votes 
+                    {
+                        approve-votes: (+ (get approve-votes current-votes) u1),
+                        voted-approvers: (unwrap-panic (as-max-len? (append (get voted-approvers current-votes) tx-sender) u10))
+                    }
+                )
+            )
+            (map-set claim-votes claim-user
+                (merge current-votes 
+                    {
+                        reject-votes: (+ (get reject-votes current-votes) u1),
+                        voted-approvers: (unwrap-panic (as-max-len? (append (get voted-approvers current-votes) tx-sender) u10))
+                    }
+                )
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-claim-decision (claim-user principal))
+    (let
+        (
+            (votes (unwrap! (map-get? claim-votes claim-user) ERR_CLAIM_NOT_FOUND))
+            (claim (unwrap! (map-get? claims claim-user) ERR_CLAIM_NOT_FOUND))
+            (policy (unwrap! (map-get? insurance-policies claim-user) ERR_NOT_AUTHORIZED))
+            (required-votes (var-get required-approvals))
+        )
+        (asserts! (not (get processed votes)) ERR_CLAIM_ALREADY_PROCESSED)
+        
+        (if (>= (get approve-votes votes) required-votes)
+            (begin
+                (try! (as-contract (stx-transfer? (get claim-amount claim) (as-contract tx-sender) claim-user)))
+                (map-set insurance-policies claim-user
+                    (merge policy {active: false})
+                )
+                (map-set claims claim-user
+                    (merge claim {status: "APPROVED"})
+                )
+                (map-set claim-votes claim-user
+                    (merge votes {status: "APPROVED", processed: true})
+                )
+                (ok "APPROVED")
+            )
+            (if (>= (get reject-votes votes) required-votes)
+                (begin
+                    (map-set insurance-policies claim-user
+                        (merge policy {active: false})
+                    )
+                    (map-set claims claim-user
+                        (merge claim {status: "REJECTED"})
+                    )
+                    (map-set claim-votes claim-user
+                        (merge votes {status: "REJECTED", processed: true})
+                    )
+                    (ok "REJECTED")
+                )
+                ERR_INSUFFICIENT_VOTES
+            )
+        )
+    )
+)
+
+(define-read-only (get-claim-votes (claim-user principal))
+    (map-get? claim-votes claim-user)
+)
+
+(define-read-only (get-approver-vote (claim-user principal) (approver principal))
+    (map-get? approver-votes {claim-user: claim-user, approver: approver})
+)
+
+(define-read-only (is-approver (user principal))
+    (default-to false (map-get? approvers user))
+)
+
+(define-read-only (get-voting-requirements)
+    {
+        required-approvals: (var-get required-approvals),
+        total-approvers: (var-get total-approvers)
+    }
+)
+
+(define-read-only (can-execute-claim (claim-user principal))
+    (let
+        (
+            (votes (map-get? claim-votes claim-user))
+        )
+        (match votes
+            vote-data
+            (and
+                (not (get processed vote-data))
+                (or
+                    (>= (get approve-votes vote-data) (var-get required-approvals))
+                    (>= (get reject-votes vote-data) (var-get required-approvals))
+                )
+            )
+            false
         )
     )
 )
